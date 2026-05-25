@@ -2,6 +2,9 @@ package dev.joseignacio.similar.adapter.out.http;
 
 import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
 import dev.joseignacio.similar.application.domain.exception.ProductNotFoundException;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.timelimiter.TimeLimiter;
+import io.github.resilience4j.timelimiter.TimeLimiterConfig;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
@@ -10,6 +13,7 @@ import org.springframework.web.reactive.function.client.WebClientResponseExcepti
 import reactor.test.StepVerifier;
 
 import java.math.BigDecimal;
+import java.time.Duration;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
 import static com.github.tomakehurst.wiremock.client.WireMock.get;
@@ -29,7 +33,12 @@ class ProductHttpAdapterTest {
     @BeforeEach
     void setUp() {
         WebClient webClient = WebClient.builder().baseUrl(wireMock.baseUrl()).build();
-        adapter = new ProductHttpAdapter(webClient);
+        // Permissive resilience instances for HTTP-focused tests.
+        CircuitBreaker circuitBreaker = CircuitBreaker.ofDefaults("test");
+        TimeLimiter timeLimiter = TimeLimiter.of(TimeLimiterConfig.custom()
+                .timeoutDuration(Duration.ofSeconds(10))
+                .build());
+        adapter = new ProductHttpAdapter(webClient, circuitBreaker, timeLimiter);
     }
 
     @Test

@@ -5,6 +5,10 @@ import dev.joseignacio.similar.application.domain.exception.ProductNotFoundExcep
 import dev.joseignacio.similar.application.domain.model.Product;
 import dev.joseignacio.similar.application.port.out.FindSimilarIdsPort;
 import dev.joseignacio.similar.application.port.out.LoadProductPort;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.reactor.circuitbreaker.operator.CircuitBreakerOperator;
+import io.github.resilience4j.reactor.timelimiter.TimeLimiterOperator;
+import io.github.resilience4j.timelimiter.TimeLimiter;
 import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.function.client.WebClient;
@@ -20,9 +24,15 @@ class ProductHttpAdapter implements FindSimilarIdsPort, LoadProductPort {
             new ParameterizedTypeReference<>() {};
 
     private final WebClient webClient;
+    private final CircuitBreaker circuitBreaker;
+    private final TimeLimiter timeLimiter;
 
-    ProductHttpAdapter(WebClient productWebClient) {
+    ProductHttpAdapter(WebClient productWebClient,
+                       CircuitBreaker productCircuitBreaker,
+                       TimeLimiter productTimeLimiter) {
         this.webClient = productWebClient;
+        this.circuitBreaker = productCircuitBreaker;
+        this.timeLimiter = productTimeLimiter;
     }
 
     @Override
@@ -32,7 +42,9 @@ class ProductHttpAdapter implements FindSimilarIdsPort, LoadProductPort {
                 .retrieve()
                 .bodyToMono(STRING_LIST)
                 .onErrorMap(WebClientResponseException.NotFound.class,
-                        e -> new ProductNotFoundException(productId));
+                        e -> new ProductNotFoundException(productId))
+                .transformDeferred(TimeLimiterOperator.of(timeLimiter))
+                .transformDeferred(CircuitBreakerOperator.of(circuitBreaker));
     }
 
     @Override
@@ -43,6 +55,8 @@ class ProductHttpAdapter implements FindSimilarIdsPort, LoadProductPort {
                 .bodyToMono(ProductDetailResponse.class)
                 .map(ProductDetailResponse::toDomain)
                 .onErrorMap(WebClientResponseException.NotFound.class,
-                        e -> new ProductNotFoundException(productId));
+                        e -> new ProductNotFoundException(productId))
+                .transformDeferred(TimeLimiterOperator.of(timeLimiter))
+                .transformDeferred(CircuitBreakerOperator.of(circuitBreaker));
     }
 }

@@ -3,6 +3,9 @@ package dev.joseignacio.similar.adapter.in.web;
 import dev.joseignacio.similar.application.domain.exception.ProductNotFoundException;
 import dev.joseignacio.similar.application.domain.model.Product;
 import dev.joseignacio.similar.application.port.in.GetSimilarProductsUseCase;
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.reactive.WebFluxTest;
@@ -13,6 +16,7 @@ import reactor.core.publisher.Mono;
 
 import java.math.BigDecimal;
 import java.util.List;
+import java.util.concurrent.TimeoutException;
 
 import static org.mockito.Mockito.when;
 
@@ -68,6 +72,38 @@ class ProductControllerTest {
                 .expectBody()
                 .jsonPath("$.status").isEqualTo(404)
                 .jsonPath("$.message").isEqualTo("Product not found: 999");
+    }
+
+    @Test
+    void returns503WhenCircuitBreakerIsOpen() {
+        CircuitBreaker openCircuit = CircuitBreaker.of("test",
+                CircuitBreakerConfig.custom().minimumNumberOfCalls(1).build());
+        openCircuit.transitionToOpenState();
+        CallNotPermittedException circuitOpen =
+                CallNotPermittedException.createCallNotPermittedException(openCircuit);
+
+        when(getSimilarProductsUseCase.getSimilarProducts("1"))
+                .thenReturn(Mono.error(circuitOpen));
+
+        webTestClient.get().uri("/product/1/similar")
+                .exchange()
+                .expectStatus().isEqualTo(503)
+                .expectBody()
+                .jsonPath("$.status").isEqualTo(503)
+                .jsonPath("$.message").isEqualTo("Upstream temporarily unavailable");
+    }
+
+    @Test
+    void returns504WhenUpstreamTimesOut() {
+        when(getSimilarProductsUseCase.getSimilarProducts("1"))
+                .thenReturn(Mono.error(new TimeoutException("upstream too slow")));
+
+        webTestClient.get().uri("/product/1/similar")
+                .exchange()
+                .expectStatus().isEqualTo(504)
+                .expectBody()
+                .jsonPath("$.status").isEqualTo(504)
+                .jsonPath("$.message").isEqualTo("Upstream did not respond in time");
     }
 
     @Test
