@@ -1,6 +1,9 @@
 # ---- Java / Maven ----
 target/
 build/
+# Keep legitimate `target` folders that happen to be in source trees
+!**/src/main/**/target/
+!**/src/test/**/target/
 *.class
 *.jar
 *.war

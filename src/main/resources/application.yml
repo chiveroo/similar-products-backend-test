@@ -1,0 +1,15 @@
+spring:
+  application:
+    name: similar-products
+
+server:
+  port: 5000
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, metrics
+  endpoint:
+    health:
+      show-details: when_authorized
