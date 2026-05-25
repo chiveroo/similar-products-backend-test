@@ -5,6 +5,9 @@ spring:
 server:
   port: 5000
 
+external-api:
+  base-url: http://localhost:3001
+
 management:
   endpoints:
     web:
