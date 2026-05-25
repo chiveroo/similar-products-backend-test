@@ -1,0 +1,98 @@
+# ---- Java / Maven ----
+target/
+build/
+*.class
+*.jar
+*.war
+*.ear
+*.zip
+*.tar.gz
+*.rar
+hs_err_pid*
+replay_pid*
+
+# Maven Wrapper (kept on purpose: .mvn/wrapper/maven-wrapper.properties)
+.mvn/wrapper/maven-wrapper.jar
+
+# ---- Spring Boot ----
+# Local-only configuration overrides (never commit secrets)
+application-local.yml
+application-local.yaml
+application-local.properties
+application-secrets.*
+*.env
+.env
+.env.*
+
+# Initializr leftover
+HELP.md
+
+# ---- IntelliJ IDEA ----
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+
+# ---- VS Code ----
+.vscode/
+*.code-workspace
+
+# ---- Eclipse / STS ----
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+bin/
+
+# ---- NetBeans ----
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+
+# ---- macOS ----
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# ---- Linux ----
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+
+# ---- Windows ----
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ---- Logs ----
+logs/
+*.log
+*.log.*
+
+# ---- Local tooling / AI assistants ----
+.atl/
+.claude/
+.cursor/
+
+# ---- Test reports ----
+**/site/
+**/surefire-reports/
+**/failsafe-reports/
+**/jacoco/
+*.coverage
+*.coverage.xml
+
+# ---- Misc ----
+*.swp
+*.swo
+*.bak
+*.tmp
