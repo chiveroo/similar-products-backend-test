@@ -1,0 +1,304 @@
+# Architecture
+
+This document captures the design decisions made before writing any production
+code. It exists so the evaluator can understand *why* the code looks the way it
+does, not just *what* it does.
+
+---
+
+## 1. Problem statement
+
+Expose a single REST endpoint that, given a product id, returns the **full
+detail** of its similar products:
+
+```
+GET /product/{productId}/similar  ->  200 [ProductDetail, ...] | 404
+```
+
+Two upstream APIs are already provided (mocked at `localhost:3001`):
+
+- `GET /product/{id}/similarids` — returns an array of similar product ids.
+- `GET /product/{id}` — returns the detail of a single product.
+
+The service to build (`yourApp`, port `5000`) is the orchestrator in between.
+
+---
+
+## 2. What the test actually measures
+
+The provided k6 script runs **5 scenarios with 200 VUs each**, including:
+
+| Scenario   | Trap                                                        |
+|------------|-------------------------------------------------------------|
+| `normal`   | Happy path                                                  |
+| `slow`     | One similar takes 1 s, another takes 5 s                    |
+| `verySlow` | One similar takes **50 s**                                  |
+| `notFound` | One similar returns **404**                                 |
+| `error`    | One similar returns **500**                                 |
+
+The official evaluation criteria are: **code clarity & maintainability**,
+**performance**, and **resilience**. Translated to engineering:
+
+1. **Fan-out must be concurrent**, never sequential.
+2. **Individual upstream failures (404/500) must NOT poison the response.**
+3. **Slow upstreams must NOT block threads or exhaust the connection pool.**
+4. **Repeated ids across scenarios reward request coalescing + a short cache.**
+
+---
+
+## 3. Stack and rationale
+
+| Concern              | Choice                                            | Why                                                                 |
+|----------------------|---------------------------------------------------|---------------------------------------------------------------------|
+| Language / runtime   | Java 21 (Temurin)                                 | LTS; `record`s express immutable domain types without Lombok.       |
+| Framework            | Spring Boot **3.5.14**                            | Latest patch of the mature 3.5 line; ecosystem fully verified.      |
+| Web stack            | Spring **WebFlux** only                           | Non-blocking I/O is a natural fit for high-fan-out aggregation. `spring-web` is **explicitly excluded** — mixing both is a known anti-pattern. |
+| HTTP client          | `WebClient`                                       | Reactive, non-blocking, integrates with Reactor backpressure.       |
+| Resilience           | **Resilience4j-reactor** (CircuitBreaker + TimeLimiter) | Industry standard; per-call time limit + per-dependency circuit. |
+| Caching + coalescing | **Caffeine `AsyncCache`**                         | Built-in request coalescing (singleflight): N concurrent callers for the same key share one upstream call. No custom cache. |
+| Config externalization | `@ConfigurationProperties` over `record`         | Type-safe, immutable, validated at startup, tunable without recompile. |
+| Error handling       | `@RestControllerAdvice` (global)                  | One place maps domain/infra exceptions to HTTP status codes.        |
+| Money type           | `java.math.BigDecimal` for `price`                | Financial precision; `double` is wrong for currency.                |
+| Tests                | JUnit 5 + WireMock + StepVerifier + WebTestClient | Realistic upstream simulation + reactive assertions.                |
+| Observability        | Micrometer + `/actuator/prometheus`               | Plugs into the provided Grafana/InfluxDB stack.                     |
+| Build                | Maven (via Maven Wrapper)                         | Single source of truth, no global install required.                 |
+| Models               | Java `record`s — no Lombok, no MapStruct          | Records cover equals/hashCode/toString; static mappers are trivial. |
+
+Why **WebFlux over MVC + virtual threads** for this specific test: the workload
+is *latency-bound I/O fan-out* (a few outbound calls per request, some very
+slow). Reactor's `flatMap(concurrency)` and per-call `timeout()` express the
+required behavior idiomatically and have first-class support in
+Resilience4j-reactor. Virtual threads would also work, but the reactive style
+makes the timeout/cancellation semantics obvious in the code.
+
+---
+
+## 4. Architectural style: Hexagonal (Ports & Adapters)
+
+The code is split in three concentric rings. Dependencies always point
+**inward** — the domain knows nothing about HTTP, Spring, or Caffeine.
+
+```
+                ┌──────────────────────────────────────────────┐
+                │                Infrastructure                │
+                │  ┌────────────────────────────────────────┐  │
+                │  │              Application               │  │
+                │  │   ┌────────────────────────────────┐   │  │
+                │  │   │            Domain              │   │  │
+                │  │   │  Product (record)              │   │  │
+                │  │   │  ProductRepository (port out)  │   │  │
+                │  │   │  GetSimilarProducts (port in)  │   │  │
+                │  │   └────────────────────────────────┘   │  │
+                │  │   GetSimilarProductsService            │  │
+                │  │   (orchestrates fan-out + resilience)  │  │
+                │  └────────────────────────────────────────┘  │
+                │   ProductController (in)                     │
+                │   GlobalErrorHandler (in)                    │
+                │   HttpProductRepository (out, WebClient)     │
+                │   WebClientConfig, ResilienceConfig          │
+                │   CacheConfig, ExternalApiProperties         │
+                └──────────────────────────────────────────────┘
+```
+
+- **Domain**: pure types and interfaces. Zero framework imports.
+- **Application**: use-case implementation. Talks to the domain only.
+- **Infrastructure**: Spring annotations, HTTP, configuration. Implements
+  the outbound ports and exposes the inbound ones via the controller.
+
+Benefits for this test: the use-case logic (fan-out, filter failures, preserve
+order) is trivially unit-testable with a mocked `ProductRepository`, no HTTP
+layer involved.
+
+---
+
+## 5. Folder structure
+
+```
+src/main/java/dev/joseignacio/similar/
+├── SimilarProductsApplication.java
+├── domain/
+│   ├── model/Product.java                       # record (id, name, BigDecimal price, boolean availability)
+│   ├── exception/ProductNotFoundException.java
+│   └── port/
+│       ├── in/GetSimilarProductsUseCase.java
+│       └── out/ProductRepository.java
+├── application/
+│   └── GetSimilarProductsService.java
+└── infrastructure/
+    ├── config/
+    │   └── ExternalApiProperties.java           # @ConfigurationProperties record
+    ├── adapter/in/web/
+    │   ├── ProductController.java
+    │   ├── GlobalErrorHandler.java              # @RestControllerAdvice
+    │   └── dto/ProductResponse.java             # record
+    └── adapter/out/http/
+        ├── HttpProductRepository.java
+        ├── WebClientConfig.java
+        ├── ResilienceConfig.java                # CircuitBreaker + TimeLimiter beans
+        ├── CacheConfig.java                     # Caffeine AsyncCache bean
+        └── dto/ProductDetailResponse.java       # record (upstream payload)
+```
+
+---
+
+## 6. Key design decisions
+
+### 6.1 Concurrent fan-out
+The use case receives `Flux<String>` of ids and resolves details with
+`flatMap(repository::findById, CONCURRENCY)`. `flatMap` (not `concatMap`)
+runs the lookups in parallel; the `concurrency` cap prevents flooding the
+upstream pool.
+
+### 6.2 Partial-failure tolerance — per-item, not global
+Each per-id lookup is wrapped with `onErrorResume(e -> Mono.empty())`
+**inside** the `flatMap` lambda, so the error is evaluated in the scope of
+that one item. A 404 or 500 from a single similar product yields a missing
+entry in the output list, **never a failure of the whole request**. The 404
+of the *base* product (its similar ids list) does propagate as a 404 to the
+client.
+
+> **Anti-pattern explicitly avoided**: `Flux.onErrorContinue` at the outer
+> stream level. Project Reactor documents it as brittle — it operates on the
+> upstream and can suppress errors in unexpected places when more operators
+> are added later. The per-item `onErrorResume` is the recommended pattern.
+
+### 6.3 Per-call time limit
+A `TimeLimiter` (from Resilience4j) is applied per upstream call (~2 s). The
+50-second mock is bounded, so one slow similar cannot block the whole
+response. Reactor cancellation propagates and frees the connection. Timeouts
+are **per call**, never multi-second global timeouts that defeat the point.
+
+### 6.4 Circuit breaker per upstream
+A single `CircuitBreaker` instance guards the upstream `localhost:3001`.
+Sliding window count-based (size 10, min 5 calls), `failureRateThreshold=50%`,
+`slowCallRateThreshold=80%` with `slowCallDurationThreshold=2s`,
+`waitDurationInOpenState=30s`, automatic transition to half-open with 3 probes.
+Protects both us and the upstream from cascading failure.
+
+### 6.5 Cache with built-in request coalescing
+The product detail lookup is wrapped with a **Caffeine `AsyncCache`** (TTL
+~30 s, bounded `maximumSize`). Two effects in one component:
+
+1. **Cache**: repeated ids across scenarios (1, 2, 3 appear in multiple k6
+   scenarios) are served from memory without hitting upstream.
+2. **Request coalescing (singleflight)**: when N concurrent callers ask for
+   the same missing key, Caffeine fires **one** loader and shares the result
+   with all N subscribers. Critical for the `verySlow` scenario — 200 VUs
+   asking for `/product/10000` produce **one** 50-second call (then bounded
+   by the time limiter), not 200.
+
+This is implemented with Caffeine out of the box; no custom
+`ConcurrentHashMap<String, Mono>` plumbing.
+
+### 6.6 Centralized error handling
+A single `@RestControllerAdvice` (`GlobalErrorHandler`) maps:
+
+| Exception                                  | HTTP status                |
+|--------------------------------------------|----------------------------|
+| `ProductNotFoundException` (base 404)      | `404 Not Found`            |
+| `CallNotPermittedException` (circuit open) | `503 Service Unavailable`  |
+| `TimeoutException`                         | `504 Gateway Timeout`      |
+| anything else                              | `500 Internal Server Error` (logged) |
+
+Controllers stay clean of try/catch and status mapping.
+
+### 6.7 Externalized configuration via `@ConfigurationProperties`
+All tunable values live in `application.yml` and are bound to an immutable
+record:
+
+```java
+@ConfigurationProperties(prefix = "external-api")
+public record ExternalApiProperties(
+    String baseUrl,
+    Duration callTimeout,
+    int concurrency,
+    Duration cacheTtl,
+    long cacheMaxSize
+) {}
+```
+
+Validated at startup. No `@Value` scattered across the codebase, no
+recompile to retune.
+
+### 6.8 No DTO leak
+The infrastructure layer translates upstream JSON
+(`ProductDetailResponse` record) to the domain `Product`. Domain types never
+travel the wire as-is, and the controller exposes its own
+`ProductResponse` record. Three records, three boundaries.
+
+### 6.9 What we deliberately did NOT do
+Decisions taken against, with reasons — useful for the evaluator to see the
+trade-offs were considered.
+
+- **No retry on timeout/5xx.** Retrying a 50-second call makes p99 worse, not
+  better. Circuit breaker + cache handle the same failure modes more
+  cheaply.
+- **No scheduled cache warming with hardcoded seed ids.** Pre-fetching only
+  the ids the k6 test happens to exercise would optimize the benchmark, not
+  the system. The cache is filled by organic traffic; coalescing and TTL do
+  the rest.
+- **No MapStruct.** With records and identical field names, a four-line
+  static mapper is clearer than annotation-processor magic.
+- **No Lombok.** Records cover the constructors, accessors, equals,
+  hashCode, and toString that Lombok used to generate.
+- **No mixed `spring-web` + `spring-webflux`.** WebFlux only. Both on the
+  classpath confuses auto-configuration and pulls in sync classes that are
+  never used.
+
+---
+
+## 7. Testing strategy (TDD)
+
+| Layer                       | Test type             | Tooling                           |
+|-----------------------------|-----------------------|-----------------------------------|
+| Domain (records)            | None (no behavior)    | —                                 |
+| Application service         | Unit (mocked port)    | JUnit 5 + Mockito + StepVerifier  |
+| HTTP adapter (out)          | Integration           | WireMock (200, 404, 500, timeout) |
+| Web adapter (in)            | Slice test            | `@WebFluxTest` + WebTestClient    |
+| Resilience (CB + timeout)   | Targeted reactive     | StepVerifier with virtual time    |
+| Cache + coalescing          | Concurrency test      | `Flux.merge` of N parallel calls; assert loader runs once |
+| Full app                    | E2E load test         | The provided k6 + Grafana         |
+
+Tests are written **before** the implementation for each layer
+(Red → Green → Refactor).
+
+---
+
+## 8. Branching & commit conventions
+
+- **GitHub Flow**: `main` is always green and deployable.
+- Work happens on short-lived `feature/*`, `fix/*`, `chore/*`, `docs/*`
+  branches, merged via PR.
+- **Conventional Commits** (`feat:`, `fix:`, `chore:`, `docs:`, `test:`,
+  `refactor:`). One-line messages preferred; body only when it adds context
+  beyond the diff.
+- Each PR keeps a single concern (scaffold, deps, one layer, etc.) to keep
+  reviews tight.
+
+---
+
+## 9. How to run
+
+```bash
+# Start the mocks, InfluxDB and Grafana
+docker compose up -d simulado influxdb grafana
+
+# Run the application
+./mvnw spring-boot:run
+
+# Smoke test
+curl http://localhost:5000/product/1/similar
+
+# Load test
+docker compose run --rm k6 run scripts/test.js
+
+# Dashboard
+open http://localhost:3000/d/Le2Ku9NMk/k6-performance-test
+```
+
+## 10. How to test
+
+```bash
+./mvnw test           # unit + slice tests
+./mvnw verify         # adds integration tests (WireMock)
+```
