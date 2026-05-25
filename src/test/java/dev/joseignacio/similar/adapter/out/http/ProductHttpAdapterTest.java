@@ -1,7 +1,10 @@
 package dev.joseignacio.similar.adapter.out.http;
 
+import com.github.benmanes.caffeine.cache.AsyncCache;
+import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
 import dev.joseignacio.similar.application.domain.exception.ProductNotFoundException;
+import dev.joseignacio.similar.application.domain.model.Product;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import io.github.resilience4j.timelimiter.TimeLimiter;
 import io.github.resilience4j.timelimiter.TimeLimiterConfig;
@@ -10,13 +13,17 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
+import reactor.core.publisher.Flux;
 import reactor.test.StepVerifier;
 
 import java.math.BigDecimal;
 import java.time.Duration;
+import java.util.List;
+import java.util.stream.IntStream;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
 import static com.github.tomakehurst.wiremock.client.WireMock.get;
+import static com.github.tomakehurst.wiremock.client.WireMock.getRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
 import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.wireMockConfig;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -33,12 +40,15 @@ class ProductHttpAdapterTest {
     @BeforeEach
     void setUp() {
         WebClient webClient = WebClient.builder().baseUrl(wireMock.baseUrl()).build();
-        // Permissive resilience instances for HTTP-focused tests.
         CircuitBreaker circuitBreaker = CircuitBreaker.ofDefaults("test");
         TimeLimiter timeLimiter = TimeLimiter.of(TimeLimiterConfig.custom()
                 .timeoutDuration(Duration.ofSeconds(10))
                 .build());
-        adapter = new ProductHttpAdapter(webClient, circuitBreaker, timeLimiter);
+        AsyncCache<String, Product> cache = Caffeine.newBuilder()
+                .maximumSize(100)
+                .expireAfterWrite(Duration.ofSeconds(30))
+                .buildAsync();
+        adapter = new ProductHttpAdapter(webClient, circuitBreaker, timeLimiter, cache);
     }
 
     @Test
@@ -116,5 +126,44 @@ class ProductHttpAdapterTest {
         StepVerifier.create(adapter.loadProduct("6"))
                 .expectError(WebClientResponseException.InternalServerError.class)
                 .verify();
+    }
+
+    @Test
+    void loadProduct_coalescesConcurrentRequestsForSameId() {
+        wireMock.stubFor(get(urlEqualTo("/product/1"))
+                .willReturn(aResponse()
+                        .withStatus(200)
+                        .withHeader("Content-Type", "application/json")
+                        .withFixedDelay(200)
+                        .withBody("""
+                                {"id":"1","name":"Shirt","price":9.99,"availability":true}
+                                """)));
+
+        List<reactor.core.publisher.Mono<Product>> concurrent = IntStream.range(0, 10)
+                .mapToObj(i -> adapter.loadProduct("1"))
+                .toList();
+
+        StepVerifier.create(Flux.merge(concurrent))
+                .expectNextCount(10)
+                .verifyComplete();
+
+        wireMock.verify(1, getRequestedFor(urlEqualTo("/product/1")));
+    }
+
+    @Test
+    void loadProduct_servesSubsequentCallsFromCache() {
+        wireMock.stubFor(get(urlEqualTo("/product/1"))
+                .willReturn(aResponse()
+                        .withStatus(200)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("""
+                                {"id":"1","name":"Shirt","price":9.99,"availability":true}
+                                """)));
+
+        StepVerifier.create(adapter.loadProduct("1")).expectNextCount(1).verifyComplete();
+        StepVerifier.create(adapter.loadProduct("1")).expectNextCount(1).verifyComplete();
+        StepVerifier.create(adapter.loadProduct("1")).expectNextCount(1).verifyComplete();
+
+        wireMock.verify(1, getRequestedFor(urlEqualTo("/product/1")));
     }
 }

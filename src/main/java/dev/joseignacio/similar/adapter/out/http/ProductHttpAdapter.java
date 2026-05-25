@@ -1,5 +1,6 @@
 package dev.joseignacio.similar.adapter.out.http;
 
+import com.github.benmanes.caffeine.cache.AsyncCache;
 import dev.joseignacio.similar.adapter.out.http.dto.ProductDetailResponse;
 import dev.joseignacio.similar.application.domain.exception.ProductNotFoundException;
 import dev.joseignacio.similar.application.domain.model.Product;
@@ -26,13 +27,16 @@ class ProductHttpAdapter implements FindSimilarIdsPort, LoadProductPort {
     private final WebClient webClient;
     private final CircuitBreaker circuitBreaker;
     private final TimeLimiter timeLimiter;
+    private final AsyncCache<String, Product> productCache;
 
     ProductHttpAdapter(WebClient productWebClient,
                        CircuitBreaker productCircuitBreaker,
-                       TimeLimiter productTimeLimiter) {
+                       TimeLimiter productTimeLimiter,
+                       AsyncCache<String, Product> productCache) {
         this.webClient = productWebClient;
         this.circuitBreaker = productCircuitBreaker;
         this.timeLimiter = productTimeLimiter;
+        this.productCache = productCache;
     }
 
     @Override
@@ -49,6 +53,12 @@ class ProductHttpAdapter implements FindSimilarIdsPort, LoadProductPort {
 
     @Override
     public Mono<Product> loadProduct(String productId) {
+        return Mono.fromFuture(
+                productCache.get(productId, (id, executor) -> fetchProductFromUpstream(id).toFuture())
+        );
+    }
+
+    private Mono<Product> fetchProductFromUpstream(String productId) {
         return webClient.get()
                 .uri("/product/{id}", productId)
                 .retrieve()

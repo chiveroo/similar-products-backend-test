@@ -7,6 +7,8 @@ server:
 
 external-api:
   base-url: http://localhost:3001
+  cache-ttl: 30s
+  cache-max-size: 1000
 
 management:
   endpoints:
