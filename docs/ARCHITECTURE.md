@@ -75,39 +75,46 @@ makes the timeout/cancellation semantics obvious in the code.
 
 ## 4. Architectural style: Hexagonal (Ports & Adapters)
 
-The code is split in three concentric rings. Dependencies always point
-**inward** — the domain knows nothing about HTTP, Spring, or Caffeine.
+The codebase follows the canonical layout popularised by Tom Hombergs'
+**Buckpal** reference project (companion to *Get Your Hands Dirty on Clean
+Architecture*). The hexagon has two sides: what's **inside** (the
+`application` package) and what's **outside** (the `adapter` package).
+Dependencies always point **inward**, toward the application.
 
 ```
-                ┌──────────────────────────────────────────────┐
-                │                Infrastructure                │
-                │  ┌────────────────────────────────────────┐  │
-                │  │              Application               │  │
-                │  │   ┌────────────────────────────────┐   │  │
-                │  │   │            Domain              │   │  │
-                │  │   │  Product (record)              │   │  │
-                │  │   │  ProductRepository (port out)  │   │  │
-                │  │   │  GetSimilarProducts (port in)  │   │  │
-                │  │   └────────────────────────────────┘   │  │
-                │  │   GetSimilarProductsService            │  │
-                │  │   (orchestrates fan-out + resilience)  │  │
-                │  └────────────────────────────────────────┘  │
-                │   ProductController (in)                     │
-                │   GlobalErrorHandler (in)                    │
-                │   HttpProductRepository (out, WebClient)     │
-                │   WebClientConfig, ResilienceConfig          │
-                │   CacheConfig, ExternalApiProperties         │
-                └──────────────────────────────────────────────┘
+                 ┌──────────────────────────────────────────────┐
+                 │                   Adapters                   │
+                 │  (Spring, Netty, WebClient, Caffeine, R4j)   │
+                 │  ┌────────────────────────────────────────┐  │
+                 │  │                Application             │  │
+                 │  │  ┌──────────────────────────────────┐  │  │
+                 │  │  │              Domain              │  │  │
+                 │  │  │  Product (record)                │  │  │
+                 │  │  │  ProductNotFoundException        │  │  │
+                 │  │  └──────────────────────────────────┘  │  │
+                 │  │  Ports (in/out interfaces)             │  │
+                 │  │  Services (use case implementations)   │  │
+                 │  └────────────────────────────────────────┘  │
+                 │                                              │
+                 │  Inbound adapters:  ProductController, …     │
+                 │  Outbound adapters: ProductHttpAdapter, …    │
+                 └──────────────────────────────────────────────┘
 ```
 
-- **Domain**: pure types and interfaces. Zero framework imports.
-- **Application**: use-case implementation. Talks to the domain only.
-- **Infrastructure**: Spring annotations, HTTP, configuration. Implements
-  the outbound ports and exposes the inbound ones via the controller.
+- **`application.domain.model`**: pure types. Zero framework imports.
+- **`application.domain.service`**: use-case implementations
+  (package-private). Talk only to ports.
+- **`application.port.in`**: use-case interfaces — the driver side of the
+  hexagon.
+- **`application.port.out`**: outbound interfaces (one per operation, ISP
+  applied) — the driven side of the hexagon.
+- **`adapter.in.web`**: Spring controllers, error handlers, response DTOs.
+- **`adapter.out.http`**: WebClient implementation of the outbound ports,
+  cache, resilience, configuration.
 
 Benefits for this test: the use-case logic (fan-out, filter failures, preserve
-order) is trivially unit-testable with a mocked `ProductRepository`, no HTTP
-layer involved.
+order) is trivially unit-testable with mocked port interfaces, no HTTP layer
+involved.
 
 ---
 
@@ -116,28 +123,36 @@ layer involved.
 ```
 src/main/java/dev/joseignacio/similar/
 ├── SimilarProductsApplication.java
-├── domain/
-│   ├── model/Product.java                       # record (id, name, BigDecimal price, boolean availability)
-│   ├── exception/ProductNotFoundException.java
-│   └── port/
-│       ├── in/GetSimilarProductsUseCase.java
-│       └── out/ProductRepository.java
-├── application/
-│   └── GetSimilarProductsService.java
-└── infrastructure/
-    ├── config/
-    │   └── ExternalApiProperties.java           # @ConfigurationProperties record
-    ├── adapter/in/web/
-    │   ├── ProductController.java
-    │   ├── GlobalErrorHandler.java              # @RestControllerAdvice
-    │   └── dto/ProductResponse.java             # record
-    └── adapter/out/http/
-        ├── HttpProductRepository.java
-        ├── WebClientConfig.java
-        ├── ResilienceConfig.java                # CircuitBreaker + TimeLimiter beans
-        ├── CacheConfig.java                     # Caffeine AsyncCache bean
-        └── dto/ProductDetailResponse.java       # record (upstream payload)
+├── adapter/
+│   ├── in/
+│   │   └── web/
+│   │       ├── ProductController.java
+│   │       ├── GlobalErrorHandler.java          # @RestControllerAdvice
+│   │       └── dto/ProductResponse.java         # record
+│   └── out/
+│       └── http/
+│           ├── ProductHttpAdapter.java          # implements both out ports
+│           ├── WebClientConfig.java
+│           ├── ResilienceConfig.java            # CircuitBreaker + TimeLimiter beans
+│           ├── CacheConfig.java                 # Caffeine AsyncCache bean
+│           ├── ExternalApiProperties.java       # @ConfigurationProperties record
+│           └── dto/ProductDetailResponse.java   # record (upstream payload)
+└── application/
+    ├── domain/
+    │   ├── model/Product.java                   # record (id, name, BigDecimal price, boolean availability)
+    │   ├── exception/ProductNotFoundException.java
+    │   └── service/
+    │       └── GetSimilarProductsService.java   # implements use case, package-private
+    └── port/
+        ├── in/GetSimilarProductsUseCase.java    # driver port
+        └── out/
+            ├── FindSimilarIdsPort.java          # driven port (one method)
+            └── LoadProductPort.java             # driven port (one method)
 ```
+
+**Outbound ports are split per operation (ISP)**: each port has exactly one
+method. A single `ProductHttpAdapter` implements both. This keeps each
+interface focused and lets a future caller depend only on what it needs.
 
 ---
 
@@ -145,16 +160,16 @@ src/main/java/dev/joseignacio/similar/
 
 ### 6.1 Concurrent fan-out
 The use case receives `Flux<String>` of ids and resolves details with
-`flatMap(repository::findById, CONCURRENCY)`. `flatMap` (not `concatMap`)
-runs the lookups in parallel; the `concurrency` cap prevents flooding the
-upstream pool.
+`flatMap(loadProductPort::loadProduct, CONCURRENCY)`. `flatMap` (not
+`concatMap`) runs the lookups in parallel; the `concurrency` cap prevents
+flooding the upstream pool.
 
 ### 6.2 Partial-failure tolerance — per-item, not global
 Each per-id lookup is wrapped with `onErrorResume(e -> Mono.empty())`
 **inside** the `flatMap` lambda, so the error is evaluated in the scope of
 that one item. A 404 or 500 from a single similar product yields a missing
 entry in the output list, **never a failure of the whole request**. The 404
-of the *base* product (its similar ids list) does propagate as a 404 to the
+of the *base* product (`findSimilarIds`) does propagate as a 404 to the
 client.
 
 > **Anti-pattern explicitly avoided**: `Flux.onErrorContinue` at the outer
@@ -176,7 +191,7 @@ Sliding window count-based (size 10, min 5 calls), `failureRateThreshold=50%`,
 Protects both us and the upstream from cascading failure.
 
 ### 6.5 Cache with built-in request coalescing
-The product detail lookup is wrapped with a **Caffeine `AsyncCache`** (TTL
+The `loadProduct` lookup is wrapped with a **Caffeine `AsyncCache`** (TTL
 ~30 s, bounded `maximumSize`). Two effects in one component:
 
 1. **Cache**: repeated ids across scenarios (1, 2, 3 appear in multiple k6
@@ -220,11 +235,14 @@ public record ExternalApiProperties(
 Validated at startup. No `@Value` scattered across the codebase, no
 recompile to retune.
 
-### 6.8 No DTO leak
-The infrastructure layer translates upstream JSON
-(`ProductDetailResponse` record) to the domain `Product`. Domain types never
-travel the wire as-is, and the controller exposes its own
-`ProductResponse` record. Three records, three boundaries.
+### 6.8 No DTO leak across layers
+Three distinct types cross the boundaries:
+
+1. `ProductDetailResponse` — record bound to the upstream JSON payload.
+2. `Product` — domain record, immutable, framework-free.
+3. `ProductResponse` — record returned by the controller to the client.
+
+Translation happens at the edges; the domain never crosses the wire.
 
 ### 6.9 What we deliberately did NOT do
 Decisions taken against, with reasons — useful for the evaluator to see the
@@ -244,6 +262,9 @@ trade-offs were considered.
 - **No mixed `spring-web` + `spring-webflux`.** WebFlux only. Both on the
   classpath confuses auto-configuration and pulls in sync classes that are
   never used.
+- **No fat repository interface.** Outbound ports are split per operation
+  (`FindSimilarIdsPort`, `LoadProductPort`). One `ProductHttpAdapter`
+  implements both. This is Interface Segregation applied to the hexagon.
 
 ---
 
@@ -252,9 +273,9 @@ trade-offs were considered.
 | Layer                       | Test type             | Tooling                           |
 |-----------------------------|-----------------------|-----------------------------------|
 | Domain (records)            | None (no behavior)    | —                                 |
-| Application service         | Unit (mocked port)    | JUnit 5 + Mockito + StepVerifier  |
-| HTTP adapter (out)          | Integration           | WireMock (200, 404, 500, timeout) |
-| Web adapter (in)            | Slice test            | `@WebFluxTest` + WebTestClient    |
+| Application service         | Unit (mocked ports)   | JUnit 5 + Mockito + StepVerifier  |
+| Outbound HTTP adapter       | Integration           | WireMock (200, 404, 500, timeout) |
+| Inbound web adapter         | Slice test            | `@WebFluxTest` + WebTestClient    |
 | Resilience (CB + timeout)   | Targeted reactive     | StepVerifier with virtual time    |
 | Cache + coalescing          | Concurrency test      | `Flux.merge` of N parallel calls; assert loader runs once |
 | Full app                    | E2E load test         | The provided k6 + Grafana         |
@@ -267,8 +288,8 @@ Tests are written **before** the implementation for each layer
 ## 8. Branching & commit conventions
 
 - **GitHub Flow**: `main` is always green and deployable.
-- Work happens on short-lived `feature/*`, `fix/*`, `chore/*`, `docs/*`
-  branches, merged via PR.
+- Work happens on short-lived `feature/*`, `fix/*`, `chore/*`, `refactor/*`,
+  `docs/*` branches, merged via PR (or fast-forward for solo work).
 - **Conventional Commits** (`feat:`, `fix:`, `chore:`, `docs:`, `test:`,
   `refactor:`). One-line messages preferred; body only when it adds context
   beyond the diff.

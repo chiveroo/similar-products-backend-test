@@ -1,4 +1,4 @@
-package dev.joseignacio.similar.domain.model;
+package dev.joseignacio.similar.application.domain.model;
 
 import java.math.BigDecimal;
 

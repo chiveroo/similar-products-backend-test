@@ -1,6 +1,6 @@
-package dev.joseignacio.similar.domain.port.in;
+package dev.joseignacio.similar.application.port.in;
 
-import dev.joseignacio.similar.domain.model.Product;
+import dev.joseignacio.similar.application.domain.model.Product;
 import reactor.core.publisher.Mono;
 
 import java.util.List;

@@ -1,4 +1,4 @@
-package dev.joseignacio.similar.domain.exception;
+package dev.joseignacio.similar.application.domain.exception;
 
 public class ProductNotFoundException extends RuntimeException {
 
