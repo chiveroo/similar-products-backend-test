@@ -190,6 +190,10 @@ Sliding window count-based (size 10, min 5 calls), `failureRateThreshold=50%`,
 `waitDurationInOpenState=30s`, automatic transition to half-open with 3 probes.
 Protects both us and the upstream from cascading failure.
 
+`ProductNotFoundException` is excluded from failure counting via
+`ignore-exceptions` — a `404` is a deterministic, legitimate upstream answer,
+not infrastructure distress, and should not contribute to opening the circuit.
+
 ### 6.5 Cache with built-in request coalescing
 The `loadProduct` lookup is wrapped with a **Caffeine `AsyncCache`** (TTL
 ~30 s, bounded `maximumSize`). Two effects in one component:
