@@ -75,11 +75,10 @@ makes the timeout/cancellation semantics obvious in the code.
 
 ## 4. Architectural style: Hexagonal (Ports & Adapters)
 
-The codebase follows the canonical layout popularised by Tom Hombergs'
-**Buckpal** reference project (companion to *Get Your Hands Dirty on Clean
-Architecture*). The hexagon has two sides: what's **inside** (the
-`application` package) and what's **outside** (the `adapter` package).
-Dependencies always point **inward**, toward the application.
+The codebase follows the canonical Hexagonal layout. The hexagon has two
+sides: what's **inside** (the `application` package) and what's **outside**
+(the `adapter` package). Dependencies always point **inward**, toward the
+application.
 
 ```
                  ┌──────────────────────────────────────────────┐
@@ -158,11 +157,14 @@ interface focused and lets a future caller depend only on what it needs.
 
 ## 6. Key design decisions
 
-### 6.1 Concurrent fan-out
+### 6.1 Concurrent fan-out (parallel + ordered)
 The use case receives `Flux<String>` of ids and resolves details with
-`flatMap(loadProductPort::loadProduct, CONCURRENCY)`. `flatMap` (not
-`concatMap`) runs the lookups in parallel; the `concurrency` cap prevents
-flooding the upstream pool.
+`flatMapSequential(loader, CONCURRENCY)`. The `Sequential` variant is the
+key choice: lookups run **in parallel** (capped at `CONCURRENCY`) but the
+emission order matches the upstream id order — required by the contract
+(*"List of similar products to a given one ordered by similarity"*). Plain
+`flatMap` would parallelise but lose order; `concatMap` would preserve order
+but serialise the calls.
 
 ### 6.2 Partial-failure tolerance — per-item, not global
 Each per-id lookup is wrapped with `onErrorResume(e -> Mono.empty())`
@@ -227,17 +229,13 @@ record:
 
 ```java
 @ConfigurationProperties(prefix = "external-api")
-public record ExternalApiProperties(
-    String baseUrl,
-    Duration callTimeout,
-    int concurrency,
-    Duration cacheTtl,
-    long cacheMaxSize
-) {}
+public record ExternalApiProperties(String baseUrl, Duration cacheTtl, long cacheMaxSize) {}
 ```
 
-Validated at startup. No `@Value` scattered across the codebase, no
-recompile to retune.
+Bound at startup, immutable thereafter. No `@Value` scattered across the
+codebase. Per-call timeout lives in Resilience4j's own properties
+(`resilience4j.timelimiter.instances.productDetails.timeout-duration`),
+tunable alongside the rest of the resilience knobs.
 
 ### 6.8 No DTO leak across layers
 Three distinct types cross the boundaries:
@@ -277,11 +275,9 @@ trade-offs were considered.
 | Layer                       | Test type             | Tooling                           |
 |-----------------------------|-----------------------|-----------------------------------|
 | Domain (records)            | None (no behavior)    | —                                 |
-| Application service         | Unit (mocked ports)   | JUnit 5 + Mockito + StepVerifier  |
-| Outbound HTTP adapter       | Integration           | WireMock (200, 404, 500, timeout) |
-| Inbound web adapter         | Slice test            | `@WebFluxTest` + WebTestClient    |
-| Resilience (CB + timeout)   | Targeted reactive     | StepVerifier with virtual time    |
-| Cache + coalescing          | Concurrency test      | `Flux.merge` of N parallel calls; assert loader runs once |
+| Application service         | Unit (mocked ports)   | JUnit 5 + Mockito + StepVerifier (`withVirtualTime` for the parallelism check) |
+| Outbound HTTP adapter       | Integration           | WireMock — 200, 404, 500, cache reuse, concurrent coalescing |
+| Inbound web adapter         | Slice                 | `@WebFluxTest` + `WebTestClient` — full error mapping (404, 503, 504, 500) |
 | Full app                    | E2E load test         | The provided k6 + Grafana         |
 
 Tests are written **before** the implementation for each layer
